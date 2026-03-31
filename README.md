@@ -1,13 +1,14 @@
 # rs-rok
 
 A Cloudflare-backed reverse tunnel tool. Expose local services behind firewalls
-to the public internet via HTTPS, similar to ngrok.
+to the public internet via HTTPS or TCP, similar to ngrok.
 
 ## Architecture
 
 - **CLI** (`rs-rok`): Rust binary that opens a WebSocket tunnel to Cloudflare and
-  proxies traffic to a local port. The Cloudflare Worker is embedded in the binary
-  and can be deployed directly to your account.
+  proxies traffic to a local port. Supports HTTP, HTTPS, and TCP tunnels. The
+  Cloudflare Worker is embedded in the binary and can be deployed directly to
+  your account.
 - **Worker**: Cloudflare Worker (TypeScript + Rust WASM) that brokers connections
   between internet clients and CLI tunnels via a Durable Object.
 - **Protocol**: Shared binary framing crate (`no_std`-compatible) used by both the
@@ -76,6 +77,28 @@ rs-rok http 8080 --name myapp
 rs-rok https 8443
 ```
 
+### 5. Expose a local TCP service
+
+TCP tunnels let you forward raw TCP traffic (databases, SSH, game servers, etc.)
+through the Cloudflare tunnel. TCP requires a named tunnel and token-based auth.
+
+```bash
+# On the server side: expose local TCP port 5432 (e.g. PostgreSQL)
+rs-rok tcp 5432 --name mydb
+# Prints a one-time token, e.g.: TCP tunnel token: abc123...
+
+# On the client side: connect and map to a local port
+rs-rok connect mydb --token abc123... --port 15432
+
+# Now connect to localhost:15432 as if it were the remote service
+psql -h 127.0.0.1 -p 15432 -U myuser mydb
+```
+
+The server side (`rs-rok tcp`) generates a single-use token that the client
+(`rs-rok connect`) uses to authenticate. Multiple clients can connect
+simultaneously, each getting an independent TCP stream multiplexed over the
+WebSocket tunnel.
+
 ## Configuration
 
 Settings are stored in `~/.rs-rok/`:
@@ -90,6 +113,9 @@ Settings are stored in `~/.rs-rok/`:
 ```
 rs-rok http <port>              Expose a local HTTP service
 rs-rok https <port>             Expose a local HTTPS service
+rs-rok tcp <port> --name <name> Expose a local TCP service (named tunnel required)
+rs-rok connect <name> --token <tok> --port <port>
+                                Connect to a TCP tunnel as a client
 rs-rok deploy                   Deploy the Worker to Cloudflare
 rs-rok config show              Print current configuration
 rs-rok config add-token <tok>   Store an auth token
