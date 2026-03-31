@@ -19,6 +19,10 @@ import {
   encode_stream_start,
   encode_stream_data,
   encode_stream_end,
+  encode_tcp_open,
+  encode_tcp_open_ack,
+  encode_tcp_data,
+  encode_tcp_close,
 } from "../pkg/rs_rok_worker_wasm.js";
 import wasmModule from "../pkg/rs_rok_worker_wasm_bg.wasm";
 
@@ -45,6 +49,10 @@ export const FRAME_WS_CLOSE = 0x0A;
 export const FRAME_STREAM_START = 0x0B;
 export const FRAME_STREAM_DATA = 0x0C;
 export const FRAME_STREAM_END = 0x0D;
+export const FRAME_TCP_OPEN = 0x0E;
+export const FRAME_TCP_OPEN_ACK = 0x0F;
+export const FRAME_TCP_DATA = 0x10;
+export const FRAME_TCP_CLOSE = 0x11;
 
 /** Parsed frame returned by parseFrame() */
 export interface ParsedFrame {
@@ -73,6 +81,9 @@ export interface ParsedFrame {
   isBinary?: boolean;
   data?: Uint8Array;
   reason?: string;
+  // TCP fields
+  streamId?: number;
+  token?: string;
 }
 
 /** Parse a binary frame from raw bytes. Returns null if incomplete. */
@@ -201,6 +212,45 @@ export function encodeStreamDataFrame(
 export function encodeStreamEndFrame(requestId: number): Uint8Array {
   ensureInit();
   return encode_stream_end(requestId);
+}
+
+/** Encode a TCP_OPEN frame. */
+export function encodeTcpOpenFrame(
+  requestId: number,
+  streamId: number,
+  token: string,
+): Uint8Array {
+  ensureInit();
+  return encode_tcp_open(requestId, streamId, token);
+}
+
+/** Encode a TCP_OPEN_ACK frame. */
+export function encodeTcpOpenAckFrame(
+  requestId: number,
+  streamId: number,
+): Uint8Array {
+  ensureInit();
+  return encode_tcp_open_ack(requestId, streamId);
+}
+
+/** Encode a TCP_DATA frame. */
+export function encodeTcpDataFrame(
+  requestId: number,
+  streamId: number,
+  data: Uint8Array,
+): Uint8Array {
+  ensureInit();
+  return encode_tcp_data(requestId, streamId, data);
+}
+
+/** Encode a TCP_CLOSE frame. */
+export function encodeTcpCloseFrame(
+  requestId: number,
+  streamId: number,
+  reason: string,
+): Uint8Array {
+  ensureInit();
+  return encode_tcp_close(requestId, streamId, reason);
 }
 
 // Method byte constants (for convenience when building REQUEST frames)

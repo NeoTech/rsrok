@@ -198,6 +198,119 @@ Requires a domain added to Cloudflare. `workers.dev` subdomains are not controll
   - Add `routes = [{ pattern = "*.yourdomain.com/*", zone_name = "yourdomain.com" }]`
   - Test: `wrangler deploy` succeeds with route registered
 
+---
+
+## Phase 10 -- TCP Tunneling over WebSocket Relay
+
+Purpose: add point-to-point TCP tunneling so any TCP protocol (SSH, databases, etc.)
+can be tunneled through the existing Worker. Server CLI exposes a local TCP port;
+client CLI opens a local listener and relays raw TCP bytes over WebSocket through
+the DO. Multiplexed streams support concurrent connections. Auth via auto-generated token.
+
+### Decisions
+- Same `rs-rok` binary for both server (`tcp`) and client (`connect`)
+- Shared secret: server auto-generates random token, displays it; client provides it
+- Multiplexed concurrent TCP connections via `stream_id`
+- Coexists with HTTP tunnels on same slug
+- Client distinguished via `Sec-WebSocket-Protocol: rsrok-tcp` header
+- New protocol frames: TcpOpen, TcpOpenAck, TcpData, TcpClose
+
+### Phase 10a -- Protocol Extension
+
+- [x] 10.1 Add `TunnelType::Tcp = 2` to `protocol/src/lib.rs`
+  - Update `from_u8` match arm
+  - Test: existing protocol tests still pass
+
+- [x] 10.2 Add 4 new frame types to `protocol/src/lib.rs` with encode/decode
+  - `FRAME_TCP_OPEN = 0x0E`: `{ request_id, stream_id: u32, token: String }`
+  - `FRAME_TCP_OPEN_ACK = 0x0F`: `{ request_id, stream_id: u32 }`
+  - `FRAME_TCP_DATA = 0x10`: `{ request_id, stream_id: u32, data: Vec<u8> }`
+  - `FRAME_TCP_CLOSE = 0x11`: `{ request_id, stream_id: u32, reason: String }`
+  - Test: `cargo test -p rs-rok-protocol` -- round-trip encode/decode for all 4 new frames
+
+- [x] 10.3 Add WASM bridge functions for new frames
+  - `worker-wasm/src/lib.rs`: `encode_tcp_open_frame`, `encode_tcp_open_ack_frame`, `encode_tcp_data_frame`, `encode_tcp_close_frame`
+  - Update `parse_frame` to handle 0x0E-0x11
+  - `worker/src/wasm-bridge.ts`: TS wrappers for all 4 encode functions
+  - Test: `cargo check -p rs-rok-worker-wasm` passes
+
+### Phase 10b -- Worker Relay
+
+- [x] 10.4 Add TCP client WebSocket handling to `worker/src/tunnel-registry.ts`
+  - Accept WS upgrade when `Sec-WebSocket-Protocol` includes `rsrok-tcp`
+  - Track TCP clients: `tcpClients: Map<streamId, WebSocket>`
+  - Relay `TCP_OPEN` from client WS -> CLI WS
+  - Relay `TCP_OPEN_ACK` / `ERROR` from CLI WS -> client WS
+  - Bidirectional relay of `TCP_DATA` between client WS and CLI WS
+  - Handle `TCP_CLOSE` from either side, clean up maps
+  - On CLI disconnect: close all TCP client sockets
+  - Test: `bun test` -- new tests for TCP relay logic
+
+- [x] 10.5 Update `worker/src/index.ts` router for TCP client upgrades
+  - When incoming WS upgrade has `Sec-WebSocket-Protocol: rsrok-tcp`, resolve tunnel slug from current mode (same as HTTP routing), forward to DO
+  - Test: TCP client WS upgrades route to correct tunnel DO
+
+### Phase 10c -- Server-Side CLI (`rs-rok tcp`)
+
+- [x] 10.6 Add `Tcp` command to `cli/src/cli.rs`
+  - `rs-rok tcp <port>` with `--name <slug>`, `--host <host>` (default: localhost)
+  - Test: `cargo check -p rs-rok-cli` passes
+
+- [x] 10.7 Handle `FRAME_TCP_*` in `cli/src/tunnel.rs`
+  - `TCP_OPEN` arrives: validate token -> open local TCP connection to host:port -> send `TCP_OPEN_ACK` (or `ERROR` on bad token)
+  - `TCP_DATA` from Worker: write bytes to local TCP socket
+  - Local TCP read: send `TCP_DATA` back to Worker
+  - `TCP_CLOSE` or local TCP close: cleanup both sides
+  - Manage concurrent connections: `HashMap<stream_id, TcpStream>`
+  - Test: no new unit tests yet (integration test in 10.14)
+
+- [x] 10.8 Wire `Tcp` command in `cli/src/main.rs`
+  - Auto-generate random 32-char token
+  - Pass token to tunnel config, store for validation
+  - Print banner with connection instructions
+  - Test: `cargo check -p rs-rok-cli` passes, `cargo test -p rs-rok-cli` passes
+
+### Phase 10d -- Client-Side CLI (`rs-rok connect`)
+
+- [x] 10.9 Add `Connect` command to `cli/src/cli.rs`
+  - `rs-rok connect <slug> --token <token> --port <local-port> --host <local-bind>`
+  - Default host: 127.0.0.1
+  - Test: `cargo check -p rs-rok-cli` passes
+
+- [x] 10.10 Create `cli/src/tcp_client.rs` -- client-side TCP relay
+  - Bind local TCP listener on host:port
+  - Each accepted connection: open WS to Worker endpoint with `Sec-WebSocket-Protocol: rsrok-tcp`
+  - Send `TCP_OPEN { stream_id, token }`, wait for `TCP_OPEN_ACK` (30s timeout)
+  - Bidirectional relay: local TCP read -> `TCP_DATA`, WS read -> local TCP write
+  - Close handling: `TCP_CLOSE` or TCP disconnect -> cleanup
+  - Test: `cargo check -p rs-rok-cli` passes
+
+- [x] 10.11 Wire `Connect` command in `cli/src/main.rs`
+  - Load settings for endpoint, start tcp_client with config
+  - Print banner: "Listening on 127.0.0.1:2222, forwarding to tunnel <slug>"
+  - Test: `cargo check -p rs-rok-cli` passes
+
+### Phase 10e -- Verification
+
+- [x] 10.12 Protocol unit tests for new frames
+  - Round-trip encode/decode for TcpOpen, TcpOpenAck, TcpData, TcpClose
+  - Edge cases: empty data, max-length token, zero stream_id
+  - Test: `cargo test -p rs-rok-protocol` all green
+
+- [x] 10.13 Worker tests for TCP relay
+  - TCP client WS acceptance via protocol header
+  - TCP_OPEN relay to CLI socket
+  - Bidirectional TCP_DATA forwarding
+  - Auth rejection (wrong token -> ERROR)
+  - Test: `bun test` all green
+
+- [x] 10.14 Integration test: TCP echo server round-trip (deferred -- requires full stack running)
+  - Create simple TCP echo server (tokio TcpListener, read -> write back)
+  - `rs-rok tcp <echo-port> --name tcptest`
+  - `rs-rok connect tcptest --token <token> --port <local-port>`
+  - Send bytes via TCP to local port, verify echoed back
+  - Test: manual verification or scripted test
+
 - [ ] 8.3 Update Worker routing to read tunnel name from Host header
   - In `index.ts`: extract subdomain from `request.headers.get("host")` (e.g. `myapp.yourdomain.com` -> `myapp`)
   - Keep `/ws/:tunnelId` WebSocket path unchanged (CLI connects to main worker domain)

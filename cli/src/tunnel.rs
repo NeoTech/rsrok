@@ -4,6 +4,8 @@ use rs_rok_protocol::{decode, encode, Frame, TunnelType};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
@@ -210,12 +212,89 @@ fn spawn_local_ws_bridge(
     cmd_tx
 }
 
+/// Command sent to a local TCP stream bridge task.
+#[derive(Debug)]
+enum LocalTcpCommand {
+    Data(Vec<u8>),
+    Close,
+}
+
+/// Spawn a bidirectional relay between a local TCP connection and the tunnel.
+fn spawn_local_tcp_bridge(
+    stream_id: u32,
+    tcp_stream: TcpStream,
+    out_tx: mpsc::UnboundedSender<Frame>,
+) -> mpsc::UnboundedSender<LocalTcpCommand> {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<LocalTcpCommand>();
+
+    tokio::spawn(async move {
+        let (mut reader, mut writer) = tcp_stream.into_split();
+        let mut buf = vec![0u8; 64 * 1024];
+
+        loop {
+            tokio::select! {
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        Some(LocalTcpCommand::Data(data)) => {
+                            if let Err(e) = writer.write_all(&data).await {
+                                debug!(stream_id, "local TCP write error: {e}");
+                                let _ = out_tx.send(Frame::TcpClose {
+                                    request_id: next_request_id(),
+                                    stream_id,
+                                    reason: format!("local TCP write error: {e}"),
+                                });
+                                break;
+                            }
+                        }
+                        Some(LocalTcpCommand::Close) | None => {
+                            let _ = writer.shutdown().await;
+                            break;
+                        }
+                    }
+                }
+                result = reader.read(&mut buf) => {
+                    match result {
+                        Ok(0) => {
+                            // EOF — remote side closed
+                            let _ = out_tx.send(Frame::TcpClose {
+                                request_id: next_request_id(),
+                                stream_id,
+                                reason: String::new(),
+                            });
+                            break;
+                        }
+                        Ok(n) => {
+                            let _ = out_tx.send(Frame::TcpData {
+                                request_id: next_request_id(),
+                                stream_id,
+                                data: buf[..n].to_vec(),
+                            });
+                        }
+                        Err(e) => {
+                            let _ = out_tx.send(Frame::TcpClose {
+                                request_id: next_request_id(),
+                                stream_id,
+                                reason: format!("local TCP read error: {e}"),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    cmd_tx
+}
+
 pub struct TunnelConfig {
     pub endpoint: String,
     pub auth_token: String,
     pub tunnel_type: TunnelType,
     pub local_addr: String,
     pub name: Option<String>,
+    /// TCP shared secret: the server validates incoming TcpOpen tokens.
+    pub tcp_token: Option<String>,
 }
 
 /// Run the tunnel with automatic reconnection via exponential backoff.
@@ -343,6 +422,7 @@ async fn connect_and_run(
     let local_scheme = match config.tunnel_type {
         TunnelType::Http => "http",
         TunnelType::Https => "https",
+        TunnelType::Tcp => "tcp",
     };
     println!();
     println!("rs-rok                                (Ctrl+C to quit)");
@@ -353,6 +433,7 @@ async fn connect_and_run(
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
     let mut ws_sessions: HashMap<u32, mpsc::UnboundedSender<LocalWsCommand>> = HashMap::new();
+    let mut tcp_streams: HashMap<u32, mpsc::UnboundedSender<LocalTcpCommand>> = HashMap::new();
 
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
@@ -389,7 +470,7 @@ async fn connect_and_run(
                                 let out_tx = out_tx.clone();
                                 let local_addr = config.local_addr.clone();
                                 let scheme = match config.tunnel_type {
-                                    TunnelType::Http => ForwardScheme::Http,
+                                    TunnelType::Http | TunnelType::Tcp => ForwardScheme::Http,
                                     TunnelType::Https => ForwardScheme::Https,
                                 };
                                 tokio::spawn(async move {
@@ -425,7 +506,7 @@ async fn connect_and_run(
                                     });
                                 }
                                 let ws_scheme = match config.tunnel_type {
-                                    TunnelType::Http => ForwardScheme::Http,
+                                    TunnelType::Http | TunnelType::Tcp => ForwardScheme::Http,
                                     TunnelType::Https => ForwardScheme::Https,
                                 };
                                 let cmd_tx = spawn_local_ws_bridge(
@@ -461,6 +542,74 @@ async fn connect_and_run(
                                     let _ = cmd_tx.send(LocalWsCommand::Close { code, reason });
                                 }
                             }
+                            Frame::TcpOpen {
+                                request_id,
+                                stream_id,
+                                token,
+                                ..
+                            } => {
+                                // Validate token
+                                let expected = config.tcp_token.as_deref().unwrap_or("");
+                                if token != expected {
+                                    warn!(stream_id, "TCP_OPEN rejected: bad token");
+                                    let _ = out_tx.send(Frame::Error {
+                                        request_id,
+                                        code: 401,
+                                        message: "invalid token".into(),
+                                    });
+                                    let _ = out_tx.send(Frame::TcpClose {
+                                        request_id: next_request_id(),
+                                        stream_id,
+                                        reason: "invalid token".into(),
+                                    });
+                                    continue;
+                                }
+
+                                // Open local TCP connection
+                                match TcpStream::connect(&config.local_addr).await {
+                                    Ok(tcp) => {
+                                        debug!(stream_id, "TCP stream opened to {}", config.local_addr);
+                                        let cmd_tx = spawn_local_tcp_bridge(stream_id, tcp, out_tx.clone());
+                                        tcp_streams.insert(stream_id, cmd_tx);
+                                        let _ = out_tx.send(Frame::TcpOpenAck {
+                                            request_id,
+                                            stream_id,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(stream_id, "TCP connect to {} failed: {e}", config.local_addr);
+                                        let _ = out_tx.send(Frame::Error {
+                                            request_id,
+                                            code: 502,
+                                            message: format!("TCP connect failed: {e}"),
+                                        });
+                                        let _ = out_tx.send(Frame::TcpClose {
+                                            request_id: next_request_id(),
+                                            stream_id,
+                                            reason: format!("connect failed: {e}"),
+                                        });
+                                    }
+                                }
+                            }
+                            Frame::TcpData {
+                                stream_id,
+                                data,
+                                ..
+                            } => {
+                                if let Some(cmd_tx) = tcp_streams.get(&stream_id) {
+                                    if cmd_tx.send(LocalTcpCommand::Data(data)).is_err() {
+                                        tcp_streams.remove(&stream_id);
+                                    }
+                                }
+                            }
+                            Frame::TcpClose {
+                                stream_id,
+                                ..
+                            } => {
+                                if let Some(cmd_tx) = tcp_streams.remove(&stream_id) {
+                                    let _ = cmd_tx.send(LocalTcpCommand::Close);
+                                }
+                            }
                             Frame::Ping { request_id } => {
                                 debug!("received PING, sending PONG");
                                 let _ = out_tx.send(Frame::Pong { request_id });
@@ -483,6 +632,9 @@ async fn connect_and_run(
                                 reason: "tunnel closed".into(),
                             });
                         }
+                        for (_, tx) in tcp_streams.drain() {
+                            let _ = tx.send(LocalTcpCommand::Close);
+                        }
                         drop(out_tx);
                         let _ = writer_task.await;
                         return Err("connection closed by server".into());
@@ -493,6 +645,9 @@ async fn connect_and_run(
                                 code: 1011,
                                 reason: "tunnel error".into(),
                             });
+                        }
+                        for (_, tx) in tcp_streams.drain() {
+                            let _ = tx.send(LocalTcpCommand::Close);
                         }
                         drop(out_tx);
                         let _ = writer_task.await;
@@ -513,6 +668,9 @@ async fn connect_and_run(
                             reason: "tunnel writer closed".into(),
                         });
                     }
+                    for (_, tx) in tcp_streams.drain() {
+                        let _ = tx.send(LocalTcpCommand::Close);
+                    }
                     let _ = writer_task.await;
                     return Err("tunnel writer closed".into());
                 }
@@ -524,6 +682,9 @@ async fn connect_and_run(
                         code: 1000,
                         reason: "shutdown".into(),
                     });
+                }
+                for (_, tx) in tcp_streams.drain() {
+                    let _ = tx.send(LocalTcpCommand::Close);
                 }
                 drop(out_tx);
                 let _ = writer_task.await;

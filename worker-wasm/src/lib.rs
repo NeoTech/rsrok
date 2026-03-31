@@ -153,6 +153,47 @@ pub fn parse_frame(data: &[u8]) -> Result<JsValue, JsValue> {
             )?;
         }
         proto::Frame::StreamEnd { .. } => {}
+        proto::Frame::TcpOpen {
+            stream_id, token, ..
+        } => {
+            js_sys::Reflect::set(
+                &obj,
+                &"streamId".into(),
+                &JsValue::from_f64(*stream_id as f64),
+            )?;
+            js_sys::Reflect::set(&obj, &"token".into(), &JsValue::from_str(token))?;
+        }
+        proto::Frame::TcpOpenAck { stream_id, .. } => {
+            js_sys::Reflect::set(
+                &obj,
+                &"streamId".into(),
+                &JsValue::from_f64(*stream_id as f64),
+            )?;
+        }
+        proto::Frame::TcpData {
+            stream_id, data, ..
+        } => {
+            js_sys::Reflect::set(
+                &obj,
+                &"streamId".into(),
+                &JsValue::from_f64(*stream_id as f64),
+            )?;
+            js_sys::Reflect::set(
+                &obj,
+                &"data".into(),
+                &js_sys::Uint8Array::from(data.as_slice()).into(),
+            )?;
+        }
+        proto::Frame::TcpClose {
+            stream_id, reason, ..
+        } => {
+            js_sys::Reflect::set(
+                &obj,
+                &"streamId".into(),
+                &JsValue::from_f64(*stream_id as f64),
+            )?;
+            js_sys::Reflect::set(&obj, &"reason".into(), &JsValue::from_str(reason))?;
+        }
     }
 
     Ok(obj.into())
@@ -360,6 +401,53 @@ pub fn encode_stream_data(request_id: u32, data: &[u8]) -> js_sys::Uint8Array {
 #[wasm_bindgen]
 pub fn encode_stream_end(request_id: u32) -> js_sys::Uint8Array {
     let bytes = proto::encode(&proto::Frame::StreamEnd { request_id });
+    js_sys::Uint8Array::from(bytes.as_slice())
+}
+
+/// Encode a TCP_OPEN frame.
+#[wasm_bindgen]
+pub fn encode_tcp_open(request_id: u32, stream_id: u32, token: &str) -> js_sys::Uint8Array {
+    let frame = proto::Frame::TcpOpen {
+        request_id,
+        stream_id,
+        token: token.into(),
+    };
+    let bytes = proto::encode(&frame);
+    js_sys::Uint8Array::from(bytes.as_slice())
+}
+
+/// Encode a TCP_OPEN_ACK frame.
+#[wasm_bindgen]
+pub fn encode_tcp_open_ack(request_id: u32, stream_id: u32) -> js_sys::Uint8Array {
+    let frame = proto::Frame::TcpOpenAck {
+        request_id,
+        stream_id,
+    };
+    let bytes = proto::encode(&frame);
+    js_sys::Uint8Array::from(bytes.as_slice())
+}
+
+/// Encode a TCP_DATA frame.
+#[wasm_bindgen]
+pub fn encode_tcp_data(request_id: u32, stream_id: u32, data: &[u8]) -> js_sys::Uint8Array {
+    let frame = proto::Frame::TcpData {
+        request_id,
+        stream_id,
+        data: data.to_vec(),
+    };
+    let bytes = proto::encode(&frame);
+    js_sys::Uint8Array::from(bytes.as_slice())
+}
+
+/// Encode a TCP_CLOSE frame.
+#[wasm_bindgen]
+pub fn encode_tcp_close(request_id: u32, stream_id: u32, reason: &str) -> js_sys::Uint8Array {
+    let frame = proto::Frame::TcpClose {
+        request_id,
+        stream_id,
+        reason: reason.into(),
+    };
+    let bytes = proto::encode(&frame);
     js_sys::Uint8Array::from(bytes.as_slice())
 }
 

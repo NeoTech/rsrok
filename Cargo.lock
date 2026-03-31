@@ -1402,6 +1402,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "native-tls",
+ "rand",
  "reqwest",
  "rs-rok-protocol",
  "serde",
@@ -1440,6 +1441,16 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rs-rok-mock-service-tcp"
+version = "0.1.0"
+dependencies = [
+ "clap",
  "tokio",
  "tracing",
  "tracing-subscriber",

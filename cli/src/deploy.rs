@@ -103,15 +103,9 @@ async fn upload_script(
             }
         ],
         "migrations": {
-            "new_tag": "v2",
-            "steps": [
-                {
-                    "new_classes": ["TunnelRegistry"]
-                },
-                {
-                    "new_classes": ["ModeRegistry"]
-                }
-            ]
+            "old_tag": "v1",
+            "new_tag": "v1",
+            "steps": []
         }
     });
 

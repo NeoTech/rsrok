@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from "bun:test";
-import { initSync, parse_frame, encode_request, encode_response, encode_ping, encode_pong, encode_error, encode_register_ack } from "../pkg/rs_rok_worker_wasm.js";
+import { initSync, parse_frame, encode_request, encode_response, encode_ping, encode_pong, encode_error, encode_register_ack, encode_tcp_open, encode_tcp_open_ack, encode_tcp_data, encode_tcp_close } from "../pkg/rs_rok_worker_wasm.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -11,6 +11,10 @@ const FRAME_RESPONSE = 0x04;
 const FRAME_PING = 0x05;
 const FRAME_PONG = 0x06;
 const FRAME_ERROR = 0x07;
+const FRAME_TCP_OPEN = 0x0E;
+const FRAME_TCP_OPEN_ACK = 0x0F;
+const FRAME_TCP_DATA = 0x10;
+const FRAME_TCP_CLOSE = 0x11;
 
 beforeAll(() => {
   const wasmPath = resolve(__dirname, "../pkg/rs_rok_worker_wasm_bg.wasm");
@@ -131,5 +135,49 @@ describe("WASM bridge", () => {
     arr.set(body, offset);
 
     expect(Array.from(wasmFrame)).toEqual(Array.from(arr));
+  });
+
+  it("encodes and parses a TCP_OPEN frame", () => {
+    const frame = encode_tcp_open(50, 1, "my-secret-token");
+    const parsed = parse_frame(frame);
+    expect(parsed.frameType).toBe(FRAME_TCP_OPEN);
+    expect(parsed.requestId).toBe(50);
+    expect(parsed.streamId).toBe(1);
+    expect(parsed.token).toBe("my-secret-token");
+  });
+
+  it("encodes and parses a TCP_OPEN_ACK frame", () => {
+    const frame = encode_tcp_open_ack(51, 2);
+    const parsed = parse_frame(frame);
+    expect(parsed.frameType).toBe(FRAME_TCP_OPEN_ACK);
+    expect(parsed.requestId).toBe(51);
+    expect(parsed.streamId).toBe(2);
+  });
+
+  it("encodes and parses a TCP_DATA frame", () => {
+    const payload = new TextEncoder().encode("hello tcp");
+    const frame = encode_tcp_data(52, 3, payload);
+    const parsed = parse_frame(frame);
+    expect(parsed.frameType).toBe(FRAME_TCP_DATA);
+    expect(parsed.requestId).toBe(52);
+    expect(parsed.streamId).toBe(3);
+    expect(new TextDecoder().decode(parsed.data)).toBe("hello tcp");
+  });
+
+  it("encodes and parses a TCP_CLOSE frame", () => {
+    const frame = encode_tcp_close(53, 4, "connection reset");
+    const parsed = parse_frame(frame);
+    expect(parsed.frameType).toBe(FRAME_TCP_CLOSE);
+    expect(parsed.requestId).toBe(53);
+    expect(parsed.streamId).toBe(4);
+    expect(parsed.reason).toBe("connection reset");
+  });
+
+  it("encodes and parses a TCP_CLOSE frame with empty reason", () => {
+    const frame = encode_tcp_close(54, 5, "");
+    const parsed = parse_frame(frame);
+    expect(parsed.frameType).toBe(FRAME_TCP_CLOSE);
+    expect(parsed.streamId).toBe(5);
+    expect(parsed.reason).toBe("");
   });
 });

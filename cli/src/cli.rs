@@ -65,6 +65,38 @@ pub enum Command {
         #[arg(long, default_value = "rs-rok")]
         name: String,
     },
+
+    /// Expose a local TCP service (e.g. SSH, database)
+    Tcp {
+        /// Local port to forward TCP traffic to
+        port: u16,
+
+        /// Stable tunnel name (required for TCP)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Local hostname to forward to
+        #[arg(long, default_value = "localhost")]
+        host: String,
+    },
+
+    /// Connect to a remote TCP tunnel
+    Connect {
+        /// Tunnel slug to connect to
+        slug: String,
+
+        /// Shared secret token from the server
+        #[arg(long)]
+        token: String,
+
+        /// Local port to listen on
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+
+        /// Local address to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

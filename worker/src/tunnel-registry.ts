@@ -4,9 +4,14 @@ import {
   encodeRequestFrame,
   encodeRegisterAckFrame,
   encodePongFrame,
+  encodeErrorFrame,
   encodeWsOpenFrame,
   encodeWsDataFrame,
   encodeWsCloseFrame,
+  encodeTcpOpenFrame,
+  encodeTcpOpenAckFrame,
+  encodeTcpDataFrame,
+  encodeTcpCloseFrame,
   methodToByte,
   FRAME_REGISTER,
   FRAME_RESPONSE,
@@ -18,6 +23,10 @@ import {
   FRAME_STREAM_START,
   FRAME_STREAM_DATA,
   FRAME_STREAM_END,
+  FRAME_TCP_OPEN,
+  FRAME_TCP_OPEN_ACK,
+  FRAME_TCP_DATA,
+  FRAME_TCP_CLOSE,
   type ParsedFrame,
 } from "./wasm-bridge";
 
@@ -35,7 +44,8 @@ type Mode = "root" | "named";
 
 type SocketAttachment =
   | { kind: "cli"; mode: Mode }
-  | { kind: "public"; wsId: number };
+  | { kind: "public"; wsId: number }
+  | { kind: "tcp"; streamId: number };
 
 // Long-poll endpoints can hold requests for tens of seconds. Keep this higher
 // than typical polling intervals to avoid false 504s.
@@ -54,6 +64,7 @@ export class TunnelRegistry implements DurableObject {
   private pendingStreams = new Map<number, PendingStream>();
   private nextRequestId = 1;
   private nextPublicSocketId = 1;
+  private tcpClients = new Map<number, WebSocket>();
   private publicUrl: string | null = null;
   private tunnelSlug: string | null = null;
   private workerOrigin: string | null = null;
@@ -82,6 +93,11 @@ export class TunnelRegistry implements DurableObject {
     // WebSocket upgrade from CLI client
     if (isWebSocketUpgrade && url.pathname.startsWith("/__rsrok_cli__/")) {
       return this.handleCliWsUpgrade(request);
+    }
+
+    // TCP client WebSocket upgrade (path: /__rsrok_tcp__/<slug>)
+    if (isWebSocketUpgrade && url.pathname.startsWith("/__rsrok_tcp__/")) {
+      return this.handleTcpClientWsUpgrade(request);
     }
 
     // Public WebSocket request to forward through tunnel
@@ -163,6 +179,26 @@ export class TunnelRegistry implements DurableObject {
     this.cliSocket = server;
 
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async handleTcpClientWsUpgrade(_request: Request): Promise<Response> {
+    const cli = this.getCliSocket();
+    if (!cli) {
+      return new Response("Tunnel not connected", { status: 502 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    // Don't assign streamId yet — the TCP client will send a TCP_OPEN frame
+    // with streamId after connecting. We tag with streamId=0 as placeholder.
+    this.state.acceptWebSocket(server, ["tcp"]);
+    this.setSocketAttachment(server, { kind: "tcp", streamId: 0 });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
   }
 
   private async handlePublicWsUpgrade(request: Request): Promise<Response> {
@@ -262,6 +298,11 @@ export class TunnelRegistry implements DurableObject {
       return;
     }
 
+    if (attachment?.kind === "tcp") {
+      this.handleTcpClientMessage(ws, attachment, message);
+      return;
+    }
+
     if (typeof message === "string") return; // binary protocol only from CLI
 
     // Load state async then handle. webSocketMessage must return void so we use
@@ -302,6 +343,15 @@ export class TunnelRegistry implements DurableObject {
           break;
         case FRAME_STREAM_END:
           this.handleStreamEnd(parsed);
+          break;
+        case FRAME_TCP_OPEN_ACK:
+          this.handleTcpOpenAck(parsed);
+          break;
+        case FRAME_TCP_DATA:
+          this.handleTcpDataFromCli(parsed);
+          break;
+        case FRAME_TCP_CLOSE:
+          this.handleTcpCloseFromCli(parsed);
           break;
         default:
           console.error("Unknown frame type:", parsed.frameType);
@@ -346,6 +396,22 @@ export class TunnelRegistry implements DurableObject {
       return;
     }
 
+    if (attachment?.kind === "tcp") {
+      const streamId = attachment.streamId;
+      if (streamId) {
+        this.tcpClients.delete(streamId);
+        const cli = this.getCliSocket();
+        if (cli && cli.readyState === WebSocket.READY_STATE_OPEN) {
+          try {
+            cli.send(encodeTcpCloseFrame(this.nextId(), streamId, reason ?? "client disconnected"));
+          } catch {
+            // ignore
+          }
+        }
+      }
+      return;
+    }
+
     if (ws === this.cliSocket || attachment?.kind === "cli") {
       this.cliSocket = null;
 
@@ -371,6 +437,16 @@ export class TunnelRegistry implements DurableObject {
           // ignore
         }
       }
+
+      // Close all active TCP client sockets when tunnel disconnects.
+      for (const tcpWs of this.state.getWebSockets("tcp")) {
+        try {
+          tcpWs.close(1012, "Tunnel disconnected");
+        } catch {
+          // ignore
+        }
+      }
+      this.tcpClients.clear();
 
       const mode: Mode = attachment?.kind === "cli"
         ? attachment.mode
@@ -521,5 +597,92 @@ export class TunnelRegistry implements DurableObject {
     this.pendingStreams.delete(frame.requestId);
     clearTimeout(stream.timer);
     stream.writer.close().catch(() => {});
+  }
+
+  // -------------------------------------------------------------------------
+  // TCP tunneling
+  // -------------------------------------------------------------------------
+
+  private getTcpClientSocket(streamId: number): WebSocket | null {
+    const ws = this.tcpClients.get(streamId);
+    if (ws && ws.readyState === WebSocket.READY_STATE_OPEN) return ws;
+    this.tcpClients.delete(streamId);
+    return null;
+  }
+
+  /** Handle binary messages arriving from a TCP client WebSocket. */
+  private handleTcpClientMessage(
+    ws: WebSocket,
+    attachment: { kind: "tcp"; streamId: number },
+    message: string | ArrayBuffer,
+  ): void {
+    if (typeof message === "string") return; // binary protocol only
+
+    const data = new Uint8Array(message instanceof ArrayBuffer ? message : (message as any).buffer ?? message);
+    const parsed = parseFrame(data);
+    if (!parsed) return;
+
+    const cli = this.getCliSocket();
+    if (!cli) {
+      ws.close(1011, "Tunnel not connected");
+      return;
+    }
+
+    switch (parsed.frameType) {
+      case FRAME_TCP_OPEN: {
+        const streamId = parsed.streamId ?? 0;
+        // Register the stream -> socket mapping
+        this.tcpClients.set(streamId, ws);
+        this.setSocketAttachment(ws, { kind: "tcp", streamId });
+        // Forward TCP_OPEN to CLI server for auth + connection
+        cli.send(encodeTcpOpenFrame(parsed.requestId, streamId, parsed.token ?? ""));
+        break;
+      }
+      case FRAME_TCP_DATA: {
+        const streamId = parsed.streamId ?? 0;
+        // Forward raw data to CLI server
+        cli.send(encodeTcpDataFrame(parsed.requestId, streamId, parsed.data ?? new Uint8Array(0)));
+        break;
+      }
+      case FRAME_TCP_CLOSE: {
+        const streamId = parsed.streamId ?? 0;
+        this.tcpClients.delete(streamId);
+        cli.send(encodeTcpCloseFrame(parsed.requestId, streamId, parsed.reason ?? ""));
+        break;
+      }
+      default:
+        // Unknown frame from TCP client, ignore
+        break;
+    }
+  }
+
+  /** TCP_OPEN_ACK from CLI -> forward to TCP client socket. */
+  private handleTcpOpenAck(frame: ParsedFrame): void {
+    const streamId = frame.streamId ?? 0;
+    const ws = this.getTcpClientSocket(streamId);
+    if (!ws) return;
+    ws.send(encodeTcpOpenAckFrame(frame.requestId, streamId));
+  }
+
+  /** TCP_DATA from CLI -> forward to TCP client socket. */
+  private handleTcpDataFromCli(frame: ParsedFrame): void {
+    const streamId = frame.streamId ?? 0;
+    const ws = this.getTcpClientSocket(streamId);
+    if (!ws) return;
+    ws.send(encodeTcpDataFrame(frame.requestId, streamId, frame.data ?? new Uint8Array(0)));
+  }
+
+  /** TCP_CLOSE from CLI -> forward to TCP client and clean up. */
+  private handleTcpCloseFromCli(frame: ParsedFrame): void {
+    const streamId = frame.streamId ?? 0;
+    const ws = this.getTcpClientSocket(streamId);
+    this.tcpClients.delete(streamId);
+    if (!ws) return;
+    try {
+      ws.send(encodeTcpCloseFrame(frame.requestId, streamId, frame.reason ?? ""));
+      ws.close(1000, "Stream closed");
+    } catch {
+      // ignore
+    }
   }
 }

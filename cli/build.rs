@@ -18,6 +18,17 @@ fn main() {
     let wasm_target = embedded_dir.join("worker.wasm");
     let name_target = embedded_dir.join("wasm_module_name.txt");
 
+    // If dist/ has been rebuilt (e.g. `bun run build:bundle` was run), prefer
+    // the fresh artifacts over stale embedded ones.
+    let dist_js = dist_dir.join("index.js");
+    if dist_js.exists() {
+        if !js_target.exists() || is_newer(&dist_js, &js_target) {
+            copy_artifacts(&dist_dir, &js_target, &wasm_target, &name_target);
+            let _ = fs::remove_dir_all(&dist_dir);
+            return;
+        }
+    }
+
     // If artifacts already exist, use them as-is. We must NOT call
     // `bun run build:bundle` from inside build.rs when Cargo holds its lock,
     // because the bundle step runs wasm-pack which spawns `cargo build` for the
@@ -108,4 +119,12 @@ fn copy_artifacts(
     // must use "./{wasm_filename}" as the part/module name.
     fs::write(name_target, wasm_filename_str.as_bytes())
         .expect("failed to write wasm_module_name.txt");
+}
+
+fn is_newer(a: &Path, b: &Path) -> bool {
+    let Ok(a_meta) = fs::metadata(a) else { return false };
+    let Ok(b_meta) = fs::metadata(b) else { return true };
+    let Ok(a_time) = a_meta.modified() else { return false };
+    let Ok(b_time) = b_meta.modified() else { return true };
+    a_time > b_time
 }

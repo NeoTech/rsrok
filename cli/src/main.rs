@@ -3,6 +3,7 @@ mod cloudflare_config;
 mod config;
 mod deploy;
 mod proxy;
+mod tcp_client;
 mod tunnel;
 mod worker_bundle;
 
@@ -83,6 +84,16 @@ async fn main() {
         } => {
             deploy_worker(account_id, api_token, &name, &config_path).await;
         }
+        Command::Tcp {
+            port, host, name,
+        } => {
+            start_tcp_tunnel(port, &host, name, &config_path).await;
+        }
+        Command::Connect {
+            slug, token, port, host,
+        } => {
+            start_tcp_client(&slug, &token, port, &host, &config_path).await;
+        }
     }
 }
 
@@ -103,10 +114,71 @@ async fn start_tunnel(
         tunnel_type,
         local_addr,
         name,
+        tcp_token: None,
     };
 
     if let Err(e) = tunnel::run(tunnel_config).await {
         error!("tunnel error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn start_tcp_tunnel(
+    port: u16,
+    host: &str,
+    name: Option<String>,
+    config_path: &std::path::Path,
+) {
+    use rand::Rng;
+
+    let settings = Settings::load(config_path);
+    let auth_token = settings.auth_token.unwrap_or_default();
+    let local_addr = format!("{host}:{port}");
+
+    // Generate a random 32-char hex token
+    let mut rng = rand::thread_rng();
+    let token_bytes: [u8; 16] = rng.gen();
+    let tcp_token: String = token_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    let slug = name.as_deref().unwrap_or("__root__");
+    println!();
+    println!("TCP tunnel token: {tcp_token}");
+    println!("Connect with:     rs-rok connect {slug} --token {tcp_token} --port <local-port>");
+    println!();
+
+    let tunnel_config = tunnel::TunnelConfig {
+        endpoint: settings.endpoint,
+        auth_token,
+        tunnel_type: TunnelType::Tcp,
+        local_addr,
+        name,
+        tcp_token: Some(tcp_token),
+    };
+
+    if let Err(e) = tunnel::run(tunnel_config).await {
+        error!("tunnel error: {e}");
+        std::process::exit(1);
+    }
+}
+
+async fn start_tcp_client(
+    slug: &str,
+    token: &str,
+    port: u16,
+    host: &str,
+    config_path: &std::path::Path,
+) {
+    let settings = Settings::load(config_path);
+
+    let client_config = tcp_client::TcpClientConfig {
+        endpoint: settings.endpoint,
+        slug: slug.to_string(),
+        token: token.to_string(),
+        local_addr: format!("{host}:{port}"),
+    };
+
+    if let Err(e) = tcp_client::run(client_config).await {
+        error!("connect error: {e}");
         std::process::exit(1);
     }
 }

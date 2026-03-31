@@ -43,6 +43,14 @@ export default {
       return env.TUNNEL_REGISTRY.get(id).fetch(request);
     }
 
+    // WebSocket upgrade from TCP client: /__rsrok_tcp__/:tunnelSlug
+    const tcpMatch = url.pathname.match(/^\/__rsrok_tcp__\/([a-zA-Z0-9_-]+)$/);
+    if (tcpMatch && request.headers.get("Upgrade") === "websocket") {
+      const slug = tcpMatch[1];
+      const id = env.TUNNEL_REGISTRY.idFromName(slug);
+      return env.TUNNEL_REGISTRY.get(id).fetch(request);
+    }
+
     // HTTP proxy — route based on current mode
     const { mode } = await modeStub(env)
       .fetch(new Request("https://mode-registry/mode"))

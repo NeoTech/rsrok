@@ -27,6 +27,10 @@ pub const FRAME_WS_CLOSE: u8 = 0x0A;
 pub const FRAME_STREAM_START: u8 = 0x0B;
 pub const FRAME_STREAM_DATA: u8 = 0x0C;
 pub const FRAME_STREAM_END: u8 = 0x0D;
+pub const FRAME_TCP_OPEN: u8 = 0x0E;
+pub const FRAME_TCP_OPEN_ACK: u8 = 0x0F;
+pub const FRAME_TCP_DATA: u8 = 0x10;
+pub const FRAME_TCP_CLOSE: u8 = 0x11;
 
 /// HTTP method encoded as a single byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +64,13 @@ impl Method {
     }
 }
 
-/// Tunnel type: HTTP or HTTPS (TLS terminated at edge).
+/// Tunnel type: HTTP, HTTPS (TLS terminated at edge), or TCP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TunnelType {
     Http = 0,
     Https = 1,
+    Tcp = 2,
 }
 
 impl TunnelType {
@@ -73,6 +78,7 @@ impl TunnelType {
         match v {
             0 => Ok(Self::Http),
             1 => Ok(Self::Https),
+            2 => Ok(Self::Tcp),
             _ => Err(DecodeError::InvalidTunnelType(v)),
         }
     }
@@ -160,6 +166,29 @@ pub enum Frame {
     StreamEnd {
         request_id: u32,
     },
+    /// Open a TCP tunnel stream (client -> server via DO).
+    TcpOpen {
+        request_id: u32,
+        stream_id: u32,
+        token: String,
+    },
+    /// Acknowledge a TCP stream open (server -> client via DO).
+    TcpOpenAck {
+        request_id: u32,
+        stream_id: u32,
+    },
+    /// Raw TCP data (bidirectional).
+    TcpData {
+        request_id: u32,
+        stream_id: u32,
+        data: Vec<u8>,
+    },
+    /// Close a TCP stream (either direction).
+    TcpClose {
+        request_id: u32,
+        stream_id: u32,
+        reason: String,
+    },
 }
 
 impl Frame {
@@ -177,7 +206,11 @@ impl Frame {
             | Frame::WsClose { request_id, .. }
             | Frame::StreamStart { request_id, .. }
             | Frame::StreamData { request_id, .. }
-            | Frame::StreamEnd { request_id } => *request_id,
+            | Frame::StreamEnd { request_id }
+            | Frame::TcpOpen { request_id, .. }
+            | Frame::TcpOpenAck { request_id, .. }
+            | Frame::TcpData { request_id, .. }
+            | Frame::TcpClose { request_id, .. } => *request_id,
         }
     }
 
@@ -196,6 +229,10 @@ impl Frame {
             Frame::StreamStart { .. } => FRAME_STREAM_START,
             Frame::StreamData { .. } => FRAME_STREAM_DATA,
             Frame::StreamEnd { .. } => FRAME_STREAM_END,
+            Frame::TcpOpen { .. } => FRAME_TCP_OPEN,
+            Frame::TcpOpenAck { .. } => FRAME_TCP_OPEN_ACK,
+            Frame::TcpData { .. } => FRAME_TCP_DATA,
+            Frame::TcpClose { .. } => FRAME_TCP_CLOSE,
         }
     }
 }
@@ -347,6 +384,28 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
         }
         Frame::StreamEnd { .. } => {
             // empty payload
+        }
+        Frame::TcpOpen {
+            stream_id, token, ..
+        } => {
+            write_u32_le(&mut payload, *stream_id);
+            write_str(&mut payload, token);
+        }
+        Frame::TcpOpenAck { stream_id, .. } => {
+            write_u32_le(&mut payload, *stream_id);
+        }
+        Frame::TcpData {
+            stream_id, data, ..
+        } => {
+            write_u32_le(&mut payload, *stream_id);
+            write_u32_le(&mut payload, data.len() as u32);
+            payload.extend_from_slice(data);
+        }
+        Frame::TcpClose {
+            stream_id, reason, ..
+        } => {
+            write_u32_le(&mut payload, *stream_id);
+            write_str(&mut payload, reason);
         }
     }
 
@@ -591,6 +650,41 @@ pub fn decode(data: &[u8]) -> Result<(Frame, usize), DecodeError> {
             }
         }
         FRAME_STREAM_END => Frame::StreamEnd { request_id },
+        FRAME_TCP_OPEN => {
+            let stream_id = r.read_u32_le()?;
+            let token = r.read_str()?;
+            Frame::TcpOpen {
+                request_id,
+                stream_id,
+                token,
+            }
+        }
+        FRAME_TCP_OPEN_ACK => {
+            let stream_id = r.read_u32_le()?;
+            Frame::TcpOpenAck {
+                request_id,
+                stream_id,
+            }
+        }
+        FRAME_TCP_DATA => {
+            let stream_id = r.read_u32_le()?;
+            let data_len = r.read_u32_le()? as usize;
+            let data = r.read_bytes(data_len)?.to_vec();
+            Frame::TcpData {
+                request_id,
+                stream_id,
+                data,
+            }
+        }
+        FRAME_TCP_CLOSE => {
+            let stream_id = r.read_u32_le()?;
+            let reason = r.read_str()?;
+            Frame::TcpClose {
+                request_id,
+                stream_id,
+                reason,
+            }
+        }
         _ => return Err(DecodeError::UnknownFrameType(frame_type)),
     };
 
@@ -996,5 +1090,115 @@ mod tests {
     #[test]
     fn stream_end_round_trip() {
         round_trip(&Frame::StreamEnd { request_id: 80 });
+    }
+
+    #[test]
+    fn register_tcp_round_trip() {
+        let frame = Frame::Register {
+            request_id: 50,
+            tunnel_id: [0x03; 16],
+            auth_token: [0x04; 32],
+            tunnel_type: TunnelType::Tcp,
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_open_round_trip() {
+        let frame = Frame::TcpOpen {
+            request_id: 90,
+            stream_id: 1,
+            token: "abc123secret".into(),
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_open_empty_token() {
+        let frame = Frame::TcpOpen {
+            request_id: 91,
+            stream_id: 0,
+            token: String::new(),
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_open_ack_round_trip() {
+        let frame = Frame::TcpOpenAck {
+            request_id: 92,
+            stream_id: 42,
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_data_round_trip() {
+        let frame = Frame::TcpData {
+            request_id: 93,
+            stream_id: 42,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_data_empty() {
+        let frame = Frame::TcpData {
+            request_id: 94,
+            stream_id: 1,
+            data: vec![],
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_data_large() {
+        let frame = Frame::TcpData {
+            request_id: 95,
+            stream_id: 7,
+            data: vec![0xAB; 65536],
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_close_round_trip() {
+        let frame = Frame::TcpClose {
+            request_id: 96,
+            stream_id: 42,
+            reason: "connection reset".into(),
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_close_empty_reason() {
+        let frame = Frame::TcpClose {
+            request_id: 97,
+            stream_id: 0,
+            reason: String::new(),
+        };
+        round_trip(&frame);
+    }
+
+    #[test]
+    fn tcp_frame_type_accessors() {
+        assert_eq!(
+            Frame::TcpOpen { request_id: 0, stream_id: 0, token: String::new() }.frame_type(),
+            FRAME_TCP_OPEN
+        );
+        assert_eq!(
+            Frame::TcpOpenAck { request_id: 0, stream_id: 0 }.frame_type(),
+            FRAME_TCP_OPEN_ACK
+        );
+        assert_eq!(
+            Frame::TcpData { request_id: 0, stream_id: 0, data: vec![] }.frame_type(),
+            FRAME_TCP_DATA
+        );
+        assert_eq!(
+            Frame::TcpClose { request_id: 0, stream_id: 0, reason: String::new() }.frame_type(),
+            FRAME_TCP_CLOSE
+        );
     }
 }
