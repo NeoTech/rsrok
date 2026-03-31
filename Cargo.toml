@@ -5,6 +5,7 @@ members = [
     "protocol",
     "worker-wasm",
     "mock-service",
+    "mock-service-https",
 ]
 
 [workspace.package]

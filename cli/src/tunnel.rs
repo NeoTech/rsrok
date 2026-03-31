@@ -11,6 +11,7 @@ use tokio_tungstenite::connect_async;
 use tracing::{debug, error, info, warn};
 
 use crate::proxy;
+use crate::proxy::ForwardScheme;
 
 static REQUEST_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -30,12 +31,17 @@ fn spawn_local_ws_bridge(
     url: String,
     headers: Vec<Header>,
     protocols: Vec<String>,
+    scheme: ForwardScheme,
     out_tx: mpsc::UnboundedSender<Frame>,
 ) -> mpsc::UnboundedSender<LocalWsCommand> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<LocalWsCommand>();
 
     tokio::spawn(async move {
-        let ws_target = format!("ws://{local_addr}{url}");
+        let ws_scheme = match scheme {
+            ForwardScheme::Http => "ws",
+            ForwardScheme::Https => "wss",
+        };
+        let ws_target = format!("{ws_scheme}://{local_addr}{url}");
         let mut req = match ws_target.clone().into_client_request() {
             Ok(req) => req,
             Err(e) => {
@@ -334,11 +340,15 @@ async fn connect_and_run(
     };
 
     // Print status banner
+    let local_scheme = match config.tunnel_type {
+        TunnelType::Http => "http",
+        TunnelType::Https => "https",
+    };
     println!();
     println!("rs-rok                                (Ctrl+C to quit)");
     println!();
     println!("Tunnel:     {public_url}");
-    println!("Forwarding: http://{}", config.local_addr);
+    println!("Forwarding: {local_scheme}://{}", config.local_addr);
     println!();
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
@@ -378,8 +388,12 @@ async fn connect_and_run(
                                 let request_frame = frame;
                                 let out_tx = out_tx.clone();
                                 let local_addr = config.local_addr.clone();
+                                let scheme = match config.tunnel_type {
+                                    TunnelType::Http => ForwardScheme::Http,
+                                    TunnelType::Https => ForwardScheme::Https,
+                                };
                                 tokio::spawn(async move {
-                                    match proxy::forward_request(&request_frame, &local_addr, &out_tx).await {
+                                    match proxy::forward_request(&request_frame, &local_addr, scheme, &out_tx).await {
                                         Ok(Some(resp)) => {
                                             let _ = out_tx.send(resp);
                                         }
@@ -410,12 +424,17 @@ async fn connect_and_run(
                                         reason: "session replaced".into(),
                                     });
                                 }
+                                let ws_scheme = match config.tunnel_type {
+                                    TunnelType::Http => ForwardScheme::Http,
+                                    TunnelType::Https => ForwardScheme::Https,
+                                };
                                 let cmd_tx = spawn_local_ws_bridge(
                                     ws_id,
                                     config.local_addr.clone(),
                                     url,
                                     headers,
                                     protocols,
+                                    ws_scheme,
                                     out_tx.clone(),
                                 );
                                 ws_sessions.insert(ws_id, cmd_tx);

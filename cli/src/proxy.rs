@@ -6,6 +6,15 @@ use rs_rok_protocol::{Frame, Header, Method};
 use std::fmt;
 use tokio::sync::mpsc;
 
+/// Which scheme to use when forwarding requests to the local service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardScheme {
+    Http,
+    Https,
+}
+
+type HyperResponse = hyper::Response<hyper::body::Incoming>;
+
 #[derive(Debug)]
 pub enum ProxyError {
     InvalidFrame(&'static str),
@@ -55,6 +64,7 @@ fn is_streaming_response(headers: &hyper::HeaderMap) -> bool {
 pub async fn forward_request(
     frame: &Frame,
     local_addr: &str,
+    scheme: ForwardScheme,
     out_tx: &mpsc::UnboundedSender<Frame>,
 ) -> Result<Option<Frame>, ProxyError> {
     let (request_id, method, url, headers, body) = match frame {
@@ -68,7 +78,11 @@ pub async fn forward_request(
         _ => return Err(ProxyError::InvalidFrame("expected REQUEST frame")),
     };
 
-    let target_uri = format!("http://{local_addr}{url}");
+    let scheme_str = match scheme {
+        ForwardScheme::Http => "http",
+        ForwardScheme::Https => "https",
+    };
+    let target_uri = format!("{scheme_str}://{local_addr}{url}");
     let uri: hyper::Uri = target_uri
         .parse()
         .map_err(|e: hyper::http::uri::InvalidUri| ProxyError::Http(e.to_string()))?;
@@ -94,13 +108,7 @@ pub async fn forward_request(
         .body(Full::new(Bytes::from(body.clone())))
         .map_err(|e| ProxyError::Http(e.to_string()))?;
 
-    let client =
-        Client::builder(TokioExecutor::new()).build(hyper_util::client::legacy::connect::HttpConnector::new());
-
-    let resp = client
-        .request(req)
-        .await
-        .map_err(|e| ProxyError::Http(e.to_string()))?;
+    let resp = send_request(req, scheme).await?;
 
     let status = resp.status().as_u16();
 
@@ -179,4 +187,48 @@ pub async fn forward_request(
         headers: resp_headers,
         body: resp_body,
     }))
+}
+
+/// Collect the full error cause chain into a single string.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(s) = source {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        source = s.source();
+    }
+    msg
+}
+
+/// Send an HTTP(S) request to the local service. Uses a TLS connector that
+/// accepts self-signed certificates when scheme is HTTPS (local dev servers).
+async fn send_request(
+    req: hyper::Request<Full<Bytes>>,
+    scheme: ForwardScheme,
+) -> Result<HyperResponse, ProxyError> {
+    match scheme {
+        ForwardScheme::Http => {
+            let client = Client::builder(TokioExecutor::new())
+                .build(hyper_util::client::legacy::connect::HttpConnector::new());
+            client
+                .request(req)
+                .await
+                .map_err(|e| ProxyError::Http(error_chain(&e)))
+        }
+        ForwardScheme::Https => {
+            let tls = native_tls::TlsConnector::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .map_err(|e| ProxyError::Http(error_chain(&e)))?;
+            let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+            http.enforce_http(false);
+            let connector = hyper_tls::HttpsConnector::from((http, tls.into()));
+            let client = Client::builder(TokioExecutor::new()).build(connector);
+            client
+                .request(req)
+                .await
+                .map_err(|e| ProxyError::Http(error_chain(&e)))
+        }
+    }
 }
