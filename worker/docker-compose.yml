@@ -1,0 +1,22 @@
+# Run the rs-rok Worker locally via workerd in a container.
+#
+# Usage:
+#   docker compose -f worker/docker-compose.yml up --build
+#
+# The Worker will be available at http://localhost:8787
+# Point the CLI at it:
+#   rs-rok config set-endpoint http://localhost:8787
+
+services:
+  workerd:
+    build:
+      context: .
+      dockerfile: Dockerfile.workerd
+    ports:
+      - "8787:8787"
+    volumes:
+      - do-data:/worker/do-data
+    restart: unless-stopped
+
+volumes:
+  do-data:

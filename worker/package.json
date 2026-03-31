@@ -4,6 +4,8 @@
   "scripts": {
     "build:wasm": "cd ../worker-wasm && wasm-pack build --target web --out-dir ../worker/pkg",
     "build:bundle": "bun run build:wasm && wrangler deploy --dry-run --outdir dist",
+    "build:workerd": "bun run build:bundle && node -e \"const fs=require('fs');const d='dist';const f=fs.readdirSync(d).find(f=>f.endsWith('.wasm'));if(f){fs.renameSync(d+'/'+f,d+'/worker.wasm');let js=fs.readFileSync(d+'/index.js','utf8');js=js.replace(f,'worker.wasm');fs.writeFileSync(d+'/index.js',js);}\"",
+    "docker": "docker compose -f docker-compose.yml up --build",
     "dev": "wrangler dev",
     "deploy": "bun run build:wasm && wrangler deploy",
     "test": "bun test",

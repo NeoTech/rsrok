@@ -1,0 +1,21 @@
+# Minimal workerd runtime container for rs-rok.
+#
+# Pre-requisite: build the Worker bundle locally first:
+#   cd worker && bun run build:workerd
+#
+# Build:  docker build -f worker/Dockerfile.workerd -t rs-rok-workerd worker/
+# Run:    docker run --rm -p 8787:8787 rs-rok-workerd
+
+FROM jacoblincool/workerd:latest
+
+WORKDIR /worker
+
+COPY dist/index.js dist/index.js
+COPY dist/worker.wasm dist/worker.wasm
+COPY workerd.capnp worker.capnp
+
+RUN mkdir -p do-data
+
+EXPOSE 8787
+
+ENTRYPOINT ["/workerd", "serve", "worker.capnp", "--verbose"]
