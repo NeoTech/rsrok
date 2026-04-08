@@ -25,21 +25,24 @@ async fn main() {
 
     // No subcommand + interactive TTY -> launch TUI
     if cli.command.is_none() && std::io::stdout().is_terminal() {
+        // On Windows, detect raw mintty (pipe handle) by probing the actual console handle.
+        // MSYSTEM is always set in Git Bash/MSYS2 regardless of whether ConPTY is active,
+        // so env var checks alone are not enough. crossterm::terminal::size() calls
+        // GetConsoleScreenBufferInfo under the hood — it succeeds when ConPTY is present
+        // (winpty, MSYS=enable_pcon, VS Code, Windows Terminal) and fails on a raw pipe.
         #[cfg(windows)]
-        if std::env::var_os("MSYSTEM").is_some()
-            || std::env::var("TERM_PROGRAM").as_deref() == Ok("mintty")
-        {
-            eprintln!("rsrok TUI does not work in Git Bash / mintty.");
+        if crossterm::terminal::size().is_err() {
+            eprintln!("rsrok TUI does not work in this terminal (raw pipe handle detected).");
             eprintln!();
             eprintln!("Options:");
             eprintln!("  1. Run in Windows Terminal, PowerShell, or Command Prompt (recommended)");
             eprintln!("  2. Prefix with winpty (ships with Git for Windows):");
             eprintln!("       winpty rsrok");
-            eprintln!("  3. Enable ConPTY in mintty by adding this to ~/.bashrc:");
+            eprintln!("  3. Enable ConPTY in mintty by adding to ~/.bashrc:");
             eprintln!("       export MSYS=enable_pcon");
             eprintln!("     then restart Git Bash (requires mintty >= 3.0)");
             eprintln!();
-            eprintln!("Note: CLI subcommands still work from Git Bash: rsrok http, rsrok tcp, ...");
+            eprintln!("Note: CLI subcommands still work from any terminal: rsrok http, rsrok tcp, ...");
             std::process::exit(1);
         }
 
