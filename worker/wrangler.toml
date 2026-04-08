@@ -18,8 +18,4 @@ bindings = [
 
 [[migrations]]
 tag = "v1"
-new_classes = ["TunnelRegistry"]
-
-[[migrations]]
-tag = "v2"
-new_classes = ["ModeRegistry"]
+new_sqlite_classes = ["TunnelRegistry", "ModeRegistry"]

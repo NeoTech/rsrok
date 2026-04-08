@@ -180,7 +180,7 @@ async fn upload_script(
                 "new_tag": "v1",
                 "steps": [
                     {
-                        "new_classes": ["TunnelRegistry", "ModeRegistry"]
+                        "new_sqlite_classes": ["TunnelRegistry", "ModeRegistry"]
                     }
                 ]
             }
